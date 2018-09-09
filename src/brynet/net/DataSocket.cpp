@@ -17,8 +17,8 @@ DataSocket::DataSocket(TcpSocket::PTR socket,
 #if defined PLATFORM_WINDOWS
     mOvlRecv(EventLoop::OLV_VALUE::OVL_RECV), 
     mOvlSend(EventLoop::OLV_VALUE::OVL_SEND),
+    mPostClose(false),
 #endif
-    mFD(socket->getFD()),
     mIP(socket->GetIP()),
     mEventLoop(eventLoop),
     mMaxRecvBufferSize(maxRecvBufferSize)
@@ -58,6 +58,8 @@ DataSocket::~DataSocket() BRYNET_NOEXCEPT
         mSSLCtx = nullptr;
     }
 #endif
+    
+    closeSocket();
 
     if (mTimer.lock())
     {
@@ -94,7 +96,6 @@ bool DataSocket::onEnterEventLoop()
     if (!brynet::net::base::SocketNonblock(mSocket->getFD()) ||
         !mEventLoop->linkChannel(mSocket->getFD(), this))
     {
-        closeSocket();
         return false;
     }
 
@@ -112,7 +113,6 @@ bool DataSocket::onEnterEventLoop()
 
     if (!checkRead())
     {
-        closeSocket();
         return false;
     }
 
@@ -162,7 +162,7 @@ void DataSocket::canRecv()
 {
 #ifdef PLATFORM_WINDOWS
     mPostRecvCheck = false;
-    if (mSocket == nullptr && !mPostWriteCheck)
+    if (mPostClose && !mPostWriteCheck)
     {
         onClose();
         return;
@@ -186,7 +186,7 @@ void DataSocket::canSend()
 {
 #ifdef PLATFORM_WINDOWS
     mPostWriteCheck = false;
-    if (mSocket == nullptr && !mPostRecvCheck)
+    if (mPostClose && !mPostRecvCheck)
     {
         onClose();
         return;
@@ -566,7 +566,18 @@ void DataSocket::procCloseInLoop()
 #ifdef PLATFORM_WINDOWS
     if (mPostWriteCheck || mPostRecvCheck)
     {
-        closeSocket();
+        mPostClose = true;
+        //windows下立即关闭socket可能导致fd被另外的DATa Socket重用
+        //而当前对象的onClose里又进行移除操作,但由于判断了对象是否相等所以是安全的
+        //TODO::但如果这里释放了，另外的fd加入了管理器，会导致此对象释放^
+        if (mPostRecvCheck)
+        {
+            CancelIoEx(HANDLE(mSocket->getFD()), &mOvlRecv.base);
+        }
+        if (mPostWriteCheck)
+        {
+            CancelIoEx(HANDLE(mSocket->getFD()), &mOvlRecv.base);
+        }
     }
     else
     {
@@ -596,25 +607,25 @@ void DataSocket::onClose()
     auto callBack = mDisConnectCallback;
     auto sharedThis = shared_from_this();
     auto eventLoop = mEventLoop;
-    auto fd = mFD;
+    if (mSocket != nullptr)
+    {
+        auto fd = mSocket->getFD();
+        mEventLoop->pushAfterLoopProc([callBack,
+            sharedThis,
+            eventLoop,
+            fd]() {
+            if (callBack != nullptr)
+            {
+                callBack(sharedThis);
+            }
+            auto tmp = eventLoop->getDataSocket(fd);
+            if (tmp == sharedThis)
+            {
+                eventLoop->removeDataSocket(fd);
+            }
+        });
+    }
 
-    mEventLoop->pushAfterLoopProc([callBack, 
-        sharedThis,
-        eventLoop,
-        fd]() {
-        if (callBack != nullptr)
-        {
-            callBack(sharedThis);
-        }
-        auto tmp = eventLoop->getDataSocket(fd);
-        assert(tmp == sharedThis);
-        if (tmp == sharedThis)
-        {
-            eventLoop->removeDataSocket(fd);
-        }
-    });
-
-    closeSocket();
     mDisConnectCallback = nullptr;
     mDataCallback = nullptr;
 }
@@ -718,7 +729,7 @@ void DataSocket::growRecvBuffer()
 {
     if (mRecvBuffer == nullptr)
     {
-        mRecvBuffer.reset(ox_buffer_new(16 * 1024 + GROW_BUFFER_SIZE));
+        mRecvBuffer.reset(ox_buffer_new(std::min<size_t>(16 * 1024, mMaxRecvBufferSize)));
     }
     else
     {
@@ -761,20 +772,18 @@ void DataSocket::startPingCheckTimer()
 
 void DataSocket::setHeartBeat(std::chrono::nanoseconds checkTime)
 {
-    assert(mEventLoop->isInLoopThread());
-    if (!mEventLoop->isInLoopThread())
-    {
-        return;
-    }
-    
-    if (mTimer.lock() != nullptr)
-    {
-        mTimer.lock()->cancel();
-        mTimer.reset();
-    }
+    auto sharedThis = shared_from_this();
+    mEventLoop->pushAsyncProc([sharedThis, checkTime]() {
+        if (sharedThis->mTimer.lock() != nullptr)
+        {
+            sharedThis->mTimer.lock()->cancel();
+            sharedThis->mTimer.reset();
+        }
 
-    mCheckTime = checkTime;
-    startPingCheckTimer();
+        sharedThis->mCheckTime = checkTime;
+        sharedThis->startPingCheckTimer();
+    });
+    
 }
 
 void DataSocket::postDisConnect()
@@ -924,8 +933,9 @@ void DataSocket::causeEnterCallback()
     {
         if (mEnterCallback != nullptr)
         {
-            mEnterCallback(shared_from_this());
+            auto tmp = mEnterCallback;
             mEnterCallback = nullptr;
+            tmp(shared_from_this());
         }
     }
 }

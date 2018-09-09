@@ -42,6 +42,7 @@ int main(int argc, char **argv)
             session->setDisConnectCallback([](const DataSocket::PTR& session) {
                 total_client_num--;
             });
+            session->postDisConnect();
         };
 
         server->addDataSocket(std::move(socket),

@@ -122,8 +122,8 @@ namespace brynet
 
             bool                            mPostRecvCheck;
             bool                            mPostWriteCheck;
+            bool                            mPostClose;
 #endif
-            const sock                      mFD;
             TcpSocket::PTR                  mSocket;
             const std::string               mIP;
             const EventLoop::PTR            mEventLoop;
